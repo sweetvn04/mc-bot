@@ -39,11 +39,7 @@ Một bot Minecraft thông minh được phát triển bằng `mineflayer`, bao 
 
 Chạy bot bằng lệnh:
 ```bash
-node MC-Bot-server.js
-```
-Hoặc phiên bản có tích hợp AI:
-```bash
-node local-api.js
+node MC-Bot-Combined.js
 ```
 
 ## Các câu lệnh chat cơ bản:
