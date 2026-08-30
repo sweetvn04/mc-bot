@@ -1,4 +1,5 @@
 require('dotenv').config()
+const readline = require('readline')
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { GoogleGenerativeAI } = require("@google/generative-ai");
@@ -6,9 +7,19 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 /**
  * CẤU HÌNH TRỰC TIẾP TỪ FILE .env
  */
+const rawHost = process.env.BOT_HOST || 'localhost';
+let BOT_HOST = rawHost;
+let BOT_PORT = process.env.BOT_PORT ? parseInt(process.env.BOT_PORT) : 25565;
+
+if (rawHost.includes(':')) {
+    const parts = rawHost.split(':');
+    BOT_HOST = parts[0];
+    BOT_PORT = parseInt(parts[1]) || BOT_PORT;
+}
+
 const BOT_USERNAME = process.env.BOT_USERNAME || 'MC_Bot_Combined';
 const BOT_PASSWORD = process.env.BOT_PASSWORD || 'password123';
-const BOT_HOST = process.env.BOT_HOST || 'localhost';
+const BOT_VERSION = process.env.BOT_VERSION || false;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // --- CẤU HÌNH AI ---
@@ -207,8 +218,10 @@ if (isAIEnabled) {
 
 const bot = mineflayer.createBot({
     host: BOT_HOST,
+    port: BOT_PORT,
     username: BOT_USERNAME,
-    version: false
+    version: BOT_VERSION,
+    hideErrors: true
 })
 
 bot.loadPlugin(pathfinder)
@@ -225,6 +238,7 @@ async function safeChat(message) {
     }
     const lines = message.split('\n').filter(line => line.trim() !== '');
     for (const line of lines) {
+        console.log(`\x1b[35m[Bot Chat]\x1b[0m ${line}`);
         bot.chat(line);
         await sleep(1000); // Khoảng chờ 1 giây giữa mỗi dòng
     }
@@ -654,35 +668,121 @@ async function runIdleBehavior() {
     lastIdleActionTime = now;
     const r = Math.random();
     try {
-        if (r < 0.25) {
+        if (r < 0.3) {
             const x = (Math.random() - 0.5) * 15, z = (Math.random() - 0.5) * 15;
             const targetPos = bot.entity.position.offset(x, 0, z);
             const move = configureMovements(bot);
             bot.pathfinder.setMovements(move);
             bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2));
-        } else if (r < 0.45) {
-            const player = bot.nearestEntity(e => e.type === 'player' && e.username !== bot.username);
-            if (player && player.position.distanceTo(bot.entity.position) < 8) await bot.lookAt(player.position.offset(0, player.height, 0));
-        } else if (r < 0.55) {
-            bot.chat(IDLE_MESSAGES[Math.floor(Math.random() * IDLE_MESSAGES.length)]);
-        } else if (r < 0.7) {
-            for (let i = 0; i < 8; i++) { await bot.look(bot.entity.yaw + Math.PI / 4, bot.entity.pitch); await sleep(50); }
-        } else if (r < 0.85) {
+        } else if (r < 0.6) {
+            const player = bot.nearestEntity(e => isPlayerEntity(e));
+            if (player && player.position.distanceTo(bot.entity.position) < 8) await bot.lookAt(player.position.offset(0, player.height || 1.6, 0));
+            else {
+                const yaw = Math.random() * Math.PI * 2;
+                const pitch = (Math.random() - 0.5) * Math.PI;
+                await bot.look(yaw, pitch);
+            }
+        } else if (r < 0.75) {
+            for (let i = 0; i < 6; i++) { await bot.look(bot.entity.yaw + Math.PI / 3, bot.entity.pitch); await sleep(60); }
+        } else if (r < 0.9) {
             bot.setControlState('jump', true); await sleep(200); bot.setControlState('jump', false);
-        } else { await spamSneak(3); }
+        } else { await spamSneak(2); }
     } catch (err) { }
+}
+
+// --- HÀM TÌM KIẾM NGƯỜI CHƠI THÔNG MINH & AN TOÀN TUYỆT ĐỐI ---
+function isPlayerEntity(e) {
+    if (!e || e === bot.entity || (bot.entity && e.id === bot.entity.id)) return false;
+    return e.type === 'player' || e.name === 'player' || e.entityType === 155;
+}
+
+function getPlayerName(e) {
+    if (!e) return null;
+    if (e.username) return e.username;
+    if (e.uuid && bot.uuidToUsername[e.uuid]) {
+        e.username = bot.uuidToUsername[e.uuid];
+        return e.username;
+    }
+    const foundP = Object.values(bot.players).find(p => p.uuid === e.uuid);
+    if (foundP?.username) {
+        e.username = foundP.username;
+        return e.username;
+    }
+    return null;
+}
+
+function findPlayerSmart(name) {
+    const rawName = (name || '').trim();
+    const lowerName = rawName.toLowerCase();
+    const isGeneric = !rawName || ['tui', 'tôi', 'me', 'bạn', 'người chơi'].includes(lowerName);
+
+    // Đồng bộ lại entity cho các player trong bot.players
+    for (const entity of Object.values(bot.entities)) {
+        if (isPlayerEntity(entity)) {
+            const pName = getPlayerName(entity);
+            if (pName && bot.players[pName]) {
+                bot.players[pName].entity = entity;
+            }
+        }
+    }
+
+    // 1. Tìm chính xác theo tên trong entities quanh bot
+    if (!isGeneric) {
+        const matchingEntity = Object.values(bot.entities).find(e => {
+            if (!isPlayerEntity(e)) return false;
+            const pName = getPlayerName(e);
+            return pName && pName.toLowerCase() === lowerName;
+        });
+        if (matchingEntity) {
+            return { entity: matchingEntity, name: getPlayerName(matchingEntity) || rawName };
+        }
+    }
+
+    // 2. Tìm trong tablist bot.players
+    if (!isGeneric) {
+        const playerKey = Object.keys(bot.players).find(k => k.toLowerCase() === lowerName);
+        if (playerKey) {
+            const p = bot.players[playerKey];
+            if (p?.entity && isPlayerEntity(p.entity)) {
+                return { entity: p.entity, name: p.username };
+            }
+        }
+    }
+
+    // 3. Nếu bạn đang đứng gần bot (trong phạm vi 32 ô), tự động bắt thực thể người chơi gần nhất!
+    const nearestPlayer = bot.nearestEntity(e => isPlayerEntity(e));
+    if (nearestPlayer) {
+        const pName = getPlayerName(nearestPlayer) || rawName || 'bạn';
+        return { entity: nearestPlayer, name: pName };
+    }
+
+    // 4. Nếu có trong tablist nhưng entity chưa tải (ở xa ngoài tầm nhìn)
+    if (!isGeneric) {
+        const playerKey = Object.keys(bot.players).find(k => k.toLowerCase() === lowerName);
+        if (playerKey) {
+            const p = bot.players[playerKey];
+            return { entity: null, name: p?.username || playerKey, isFar: true };
+        }
+    }
+
+    return null;
 }
 
 // --- BOT ACTIONS (UNIFIED) ---
 const botActions = {
-    followPlayer: (args) => {
+    followPlayer: (args = {}) => {
         resetStates();
-        const target = bot.players[args.username]?.entity;
-        if (target) {
-            followTarget = target;
-            return `Đang đi theo ${args.username} nè!`;
+        const targetInfo = findPlayerSmart(args.username);
+        if (targetInfo?.entity) {
+            followTarget = targetInfo.entity;
+            return `Đang đi theo ${targetInfo.name} nè!`;
         }
-        return `Tui hổng thấy ${args.username} ở đâu cả.`;
+        const pos = bot.entity.position;
+        const botPos = `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}`;
+        if (targetInfo?.isFar) {
+            return `Tui thấy ${targetInfo.name} đang online nhưng bạn ở xa quá (ngoài tầm nhìn)! Tui đang ở tọa độ: ${botPos}. Bạn hãy lại gần tui nha!`;
+        }
+        return `Tui hổng thấy bạn ở đâu quanh đây cả! Tui đang đứng tại tọa độ: ${botPos}. Hãy lại gần tui nhé!`;
     },
     stopAction: () => {
         resetStates();
@@ -731,15 +831,20 @@ const botActions = {
         startFarmingLoop();
         return "Bắt đầu làm ruộng thôi nào! Tui sẽ gặt và trồng lại cây cho.";
     },
-    protectPlayer: (args) => {
+    protectPlayer: (args = {}) => {
         resetStates();
-        const target = bot.players[args.username]?.entity;
-        if (target) {
-            followTarget = target;
+        const targetInfo = findPlayerSmart(args.username);
+        if (targetInfo?.entity) {
+            followTarget = targetInfo.entity;
             isBodyguardMode = true;
-            return `Ok! Tui sẽ đi theo và bảo vệ ${args.username} hết mình!`;
+            return `Ok! Tui sẽ đi theo và bảo vệ ${targetInfo.name} hết mình!`;
         }
-        return `Tui không thấy ${args.username} đâu để bảo vệ hết.`;
+        const pos = bot.entity.position;
+        const botPos = `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}`;
+        if (targetInfo?.isFar) {
+            return `Tui thấy ${targetInfo.name} đang online nhưng bạn ở xa quá! Tui đang ở tọa độ: ${botPos}. Hãy lại gần tui để tui bảo vệ nha!`;
+        }
+        return `Tui không thấy bạn đâu để bảo vệ hết! Tui đang ở tọa độ: ${botPos}.`;
     },
     storeItems: async () => {
         return await storeItems();
@@ -798,7 +903,7 @@ function handleManualCommand(username, message) {
 
     switch (command) {
         case 'follow':
-            safeChat(botActions.followPlayer({ username }));
+            safeChat(botActions.followPlayer({ username: args[1] || username }));
             break;
         case 'stop':
             safeChat(botActions.stopAction());
@@ -822,7 +927,7 @@ function handleManualCommand(username, message) {
             safeChat(botActions.startFarming());
             break;
         case 'protect':
-            safeChat(botActions.protectPlayer({ username }));
+            safeChat(botActions.protectPlayer({ username: args[1] || username }));
             break;
         case 'store':
             botActions.storeItems().then(res => safeChat(res));
@@ -892,10 +997,27 @@ bot.on('spawn', () => {
     }, 3000);
 });
 
+let lastServerMessage = '';
+let lastServerMessageTime = 0;
+
 bot.on('messagestr', (message) => {
-    console.log(`[Server] ${message}`);
-    if (message.includes('/login') || message.includes('Dùng lệnh /login')) bot.chat(`/login ${BOT_PASSWORD}`);
-    if (message.includes('/register') || message.includes('Dùng lệnh /register')) bot.chat(`/register ${BOT_PASSWORD} ${BOT_PASSWORD}`);
+    const trimmed = message.trim();
+    if (!trimmed) return;
+
+    // Tự động phản hồi lệnh login/register
+    if (trimmed.includes('/login') || trimmed.includes('Dùng lệnh /login')) bot.chat(`/login ${BOT_PASSWORD}`);
+    if (trimmed.includes('/register') || trimmed.includes('Dùng lệnh /register')) bot.chat(`/register ${BOT_PASSWORD} ${BOT_PASSWORD}`);
+
+    // Bỏ qua tin nhắn tọa độ/HUD/Actionbar lặp lại
+    if (/XYZ:\s*-?\d+/i.test(trimmed) || /☀|☁|🌧/.test(trimmed)) return;
+
+    // Chống in tin nhắn trùng lặp liên tục trong 10 giây
+    const now = Date.now();
+    if (trimmed === lastServerMessage && now - lastServerMessageTime < 10000) return;
+    lastServerMessage = trimmed;
+    lastServerMessageTime = now;
+
+    console.log(`\x1b[33m[Server]\x1b[0m ${trimmed}`);
 });
 
 bot.on('health', () => autoEat());
@@ -959,10 +1081,18 @@ bot.on('physicTick', () => {
 
 const chatHistory = [];
 
-bot.on('chat', async (username, message) => {
-    if (username === bot.username) return;
+let isAIProcessing = false;
+let hasNotifiedAIError = false;
 
-    if (isAIEnabled) {
+bot.on('chat', async (username, message) => {
+    if (!username) return;
+    const lowerUser = username.toLowerCase();
+    if (lowerUser === bot.username.toLowerCase() || lowerUser === BOT_USERNAME.toLowerCase() || lowerUser === 'server' || lowerUser === 'system') return;
+    if (/XYZ:\s*-?\d+/i.test(message) || /☀|☁|🌧/.test(message)) return;
+    if (message.includes('AI đang bận') || message.includes('chế độ lệnh thủ công')) return;
+
+    if (isAIEnabled && !isAIInError && !isAIProcessing) {
+        isAIProcessing = true;
         try {
             const chat = model.startChat({ history: chatHistory });
             const prompt = `Người chơi ${username} nói: ${message}`;
@@ -995,14 +1125,20 @@ bot.on('chat', async (username, message) => {
             chatHistory.push({ role: 'user', parts: [{ text: prompt }] });
             chatHistory.push({ role: 'model', parts: [{ text: reply }] });
             if (chatHistory.length > 20) chatHistory.splice(0, 2);
-            isAIInError = false; // Reset trạng thái lỗi nếu AI chạy thành công
             return;
         } catch (error) {
-            console.error("Lỗi AI, chuyển sang dùng lệnh thủ công:", error.message);
-            if (!isAIInError) {
-                isAIInError = true;
-                safeChat("⚠️ AI đang bận hoặc hết hạn mức, mình chuyển sang chế độ thủ công nha! Gõ 'api' để thử kết nối lại.");
+            isAIInError = true; // Khóa AI ngay lập tức để không spam request
+            if (error.message?.includes('429') || error.message?.includes('quota')) {
+                console.log('\x1b[33m[AI]\x1b[0m Hạn mức API tạm thời hết (5 lượt/phút). Tự động chuyển sang lệnh chat thủ công. Gõ "api" trong game để thử kết nối lại sau.');
+            } else {
+                console.log(`\x1b[31m[AI Lỗi]\x1b[0m ${error.message}`);
             }
+            if (!hasNotifiedAIError) {
+                hasNotifiedAIError = true;
+                safeChat("⚠️ AI đang bận hoặc hết hạn mức, mình chuyển sang chế độ lệnh thủ công nha! Gõ 'api' để thử kết nối lại.");
+            }
+        } finally {
+            isAIProcessing = false;
         }
     }
 
@@ -1012,3 +1148,34 @@ bot.on('chat', async (username, message) => {
 
 bot.on('error', (err) => console.log('⚠️ Lỗi:', err));
 bot.on('kicked', (reason) => console.log('❌ Bị kick:', reason));
+
+// --- NHẬN LỆNH TRỰC TIẾP TỪ TERMINAL (CLI) ---
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false
+});
+
+rl.on('line', (line) => {
+    const input = line.trim();
+    if (!input) return;
+
+    // 1. Chat tin nhắn vào server: "say <nội dung>" hoặc "chat <nội dung>"
+    if (input.startsWith('say ') || input.startsWith('chat ')) {
+        const text = input.substring(input.indexOf(' ') + 1);
+        bot.chat(text);
+        console.log(`\x1b[32m[Terminal Chat]\x1b[0m ${text}`);
+        return;
+    }
+
+    // 2. Gửi lệnh server Minecraft (bắt đầu bằng /): /tp, /spawn, /home, /tpa...
+    if (input.startsWith('/')) {
+        bot.chat(input);
+        console.log(`\x1b[32m[Terminal Server Cmd]\x1b[0m ${input}`);
+        return;
+    }
+
+    // 3. Thực thi lệnh điều khiển bot trực tiếp (farm, guard, dig, stop, status, goto, armor, store...)
+    console.log(`\x1b[32m[Terminal Lệnh Bot]\x1b[0m ${input}`);
+    handleManualCommand('Terminal', input);
+});

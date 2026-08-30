@@ -1,4 +1,5 @@
 require('dotenv').config()
+const readline = require('readline')
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 
@@ -7,14 +8,26 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 /**
  * CẤU HÌNH TRỰC TIẾP TỪ FILE .env
  */
+const rawHost = process.env.BOT_HOST || 'localhost';
+let BOT_HOST = rawHost;
+let BOT_PORT = process.env.BOT_PORT ? parseInt(process.env.BOT_PORT) : 25565;
+
+if (rawHost.includes(':')) {
+    const parts = rawHost.split(':');
+    BOT_HOST = parts[0];
+    BOT_PORT = parseInt(parts[1]) || BOT_PORT;
+}
+
 const BOT_USERNAME = process.env.BOT_USERNAME || 'AFK_Bot';
 const BOT_PASSWORD = process.env.BOT_PASSWORD || 'password123';
-const BOT_HOST = process.env.BOT_HOST || 'localhost';
+const BOT_VERSION = process.env.BOT_VERSION || false;
 
 const bot = mineflayer.createBot({
     host: BOT_HOST,
+    port: BOT_PORT,
     username: BOT_USERNAME,
-    version: false
+    version: BOT_VERSION,
+    hideErrors: true
 })
 
 // Nạp plugin tìm đường
@@ -70,6 +83,24 @@ const FOOD_NAMES = [
     'beef', 'chicken', 'porkchop', 'mutton', 'rabbit', 'cod', 'salmon', 'potato', 'rotten_flesh'
 ];
 
+// --- HÀM GỬI TIN NHẮN AN TOÀN (CHỐNG KICK SPAM CHAT) ---
+async function safeChat(message) {
+    if (!message) return;
+    if (typeof message !== 'string') {
+        if (message instanceof Promise) {
+            message = await message;
+        } else {
+            message = String(message);
+        }
+    }
+    const lines = message.split('\n').filter(line => line.trim() !== '');
+    for (const line of lines) {
+        console.log(`\x1b[35m[Bot Chat]\x1b[0m ${line}`);
+        bot.chat(line);
+        await sleep(1000);
+    }
+}
+
 // --- BIẾN COOLDOWN ---
 let lastDoorOpenTime = 0;
 let lastPickupTime = 0;
@@ -106,31 +137,130 @@ function configureMovements(bot) {
     return move;
 }
 
+function resetStates() {
+    followTarget = null;
+    isDigging = false;
+    isAttacking = false;
+    isGuardMode = false;
+    isFarming = false;
+    isBodyguardMode = false;
+    targetBlockName = null;
+    targetEntity = null;
+    targetMobName = null;
+    targetPickupItem = null;
+}
+
+// --- HÀM TÌM KIẾM NGƯỜI CHƠI THÔNG MINH & AN TOÀN ---
+function isPlayerEntity(e) {
+    if (!e || e === bot.entity || (bot.entity && e.id === bot.entity.id)) return false;
+    return e.type === 'player' || e.name === 'player' || e.entityType === 155;
+}
+
+function getPlayerName(e) {
+    if (!e) return null;
+    if (e.username) return e.username;
+    if (e.uuid && bot.uuidToUsername[e.uuid]) {
+        e.username = bot.uuidToUsername[e.uuid];
+        return e.username;
+    }
+    const foundP = Object.values(bot.players).find(p => p.uuid === e.uuid);
+    if (foundP?.username) {
+        e.username = foundP.username;
+        return e.username;
+    }
+    return null;
+}
+
+function findPlayerSmart(name) {
+    const rawName = (name || '').trim();
+    const lowerName = rawName.toLowerCase();
+    const isGeneric = !rawName || ['tui', 'tôi', 'me', 'bạn', 'người chơi'].includes(lowerName);
+
+    // Đồng bộ lại entity cho các player trong bot.players
+    for (const entity of Object.values(bot.entities)) {
+        if (isPlayerEntity(entity)) {
+            const pName = getPlayerName(entity);
+            if (pName && bot.players[pName]) {
+                bot.players[pName].entity = entity;
+            }
+        }
+    }
+
+    // 1. Tìm chính xác theo tên trong entities quanh bot
+    if (!isGeneric) {
+        const matchingEntity = Object.values(bot.entities).find(e => {
+            if (!isPlayerEntity(e)) return false;
+            const pName = getPlayerName(e);
+            return pName && pName.toLowerCase() === lowerName;
+        });
+        if (matchingEntity) {
+            return { entity: matchingEntity, name: getPlayerName(matchingEntity) || rawName };
+        }
+    }
+
+    // 2. Tìm trong tablist bot.players
+    if (!isGeneric) {
+        const playerKey = Object.keys(bot.players).find(k => k.toLowerCase() === lowerName);
+        if (playerKey) {
+            const p = bot.players[playerKey];
+            if (p?.entity && isPlayerEntity(p.entity)) {
+                return { entity: p.entity, name: p.username };
+            }
+        }
+    }
+
+    // 3. Nếu bạn đang đứng gần bot (trong phạm vi 32 ô), tự động bắt thực thể người chơi gần nhất!
+    const nearestPlayer = bot.nearestEntity(e => isPlayerEntity(e));
+    if (nearestPlayer) {
+        const pName = getPlayerName(nearestPlayer) || rawName || 'bạn';
+        return { entity: nearestPlayer, name: pName };
+    }
+
+    // 4. Nếu có trong tablist nhưng entity chưa tải (ở xa ngoài tầm nhìn)
+    if (!isGeneric) {
+        const playerKey = Object.keys(bot.players).find(k => k.toLowerCase() === lowerName);
+        if (playerKey) {
+            const p = bot.players[playerKey];
+            return { entity: null, name: p?.username || playerKey, isFar: true };
+        }
+    }
+
+    return null;
+}
+
 // --- AUTO LOGIN (QUAN TRỌNG CHO SERVER PUBLIC) ---
 bot.on('spawn', () => {
-    console.log('✅ Đã kết nối vào server!');
-
-    // Tự động đăng nhập/đăng ký
-    // Thử login trước, nếu chưa đăng ký thì đăng ký
-    // Lưu ý: Logic này chỉ là ví dụ cơ bản, tùy server mà lệnh có thể khác (/login, /l, /reg)
+    logThink('✅ Đã kết nối vào server!');
     setTimeout(() => {
         bot.chat(`/login ${BOT_PASSWORD}`);
-        bot.chat(`/register ${BOT_PASSWORD} ${BOT_PASSWORD}`);
-        console.log('🔑 Đã gửi lệnh đăng nhập/đăng ký.');
-    }, 2000); // Đợi 2s sau khi vào để server tải tài nguyên
+        bot.chat(`/l ${BOT_PASSWORD}`);
+        setTimeout(() => {
+            bot.chat(`/register ${BOT_PASSWORD} ${BOT_PASSWORD}`);
+            bot.chat(`/reg ${BOT_PASSWORD} ${BOT_PASSWORD}`);
+        }, 1500);
+        logThink('🔑 Đã gửi lệnh đăng nhập/đăng ký.');
+    }, 3000);
 });
 
-bot.on('messagestr', (message) => {
-    // Tự động xử lý captcha nếu có (ví dụ: "Nhập mã 1234 để tiếp tục")
-    // Phần này phức tạp, cần tùy chỉnh theo server
-    console.log(`[Server] ${message}`);
+let lastServerMessage = '';
+let lastServerMessageTime = 0;
 
-    if (message.includes('/login') || message.includes('Dùng lệnh /login')) {
-        bot.chat(`/login ${BOT_PASSWORD}`);
-    }
-    if (message.includes('/register') || message.includes('Dùng lệnh /register')) {
-        bot.chat(`/register ${BOT_PASSWORD} ${BOT_PASSWORD}`);
-    }
+bot.on('messagestr', (message) => {
+    const trimmed = message.trim();
+    if (!trimmed) return;
+
+    if (trimmed.includes('/login') || trimmed.includes('Dùng lệnh /login')) bot.chat(`/login ${BOT_PASSWORD}`);
+    if (trimmed.includes('/register') || trimmed.includes('Dùng lệnh /register')) bot.chat(`/register ${BOT_PASSWORD} ${BOT_PASSWORD}`);
+
+    // Bỏ qua tin nhắn Actionbar/Tọa độ lặp lại
+    if (/XYZ:\s*-?\d+/i.test(trimmed) || /☀|☁|🌧/.test(trimmed)) return;
+
+    const now = Date.now();
+    if (trimmed === lastServerMessage && now - lastServerMessageTime < 10000) return;
+    lastServerMessage = trimmed;
+    lastServerMessageTime = now;
+
+    console.log(`\x1b[33m[Server]\x1b[0m ${trimmed}`);
 });
 
 // --- CÁC HÀM LOGIC CHIẾN ĐẤU & FARMING (GIỮ NGUYÊN TỪ BẢN LOCAL) ---
@@ -183,73 +313,76 @@ async function runGuardLogic() {
 
 async function startFarmingLoop() {
     while (isFarming) {
-        // 1. Tìm cây chín để gặt
-        let target = bot.findBlock({
+        // Tìm tất cả cây đã chín
+        const matureCrops = bot.findBlocks({
             matching: b => {
-                if (!CROP_TYPES.includes(b.name)) return false;
+                if (!b || !b.position || !CROP_TYPES.includes(b.name)) return false;
                 const age = b.metadata;
                 return age >= 7 || (b.name === 'beetroots' && age >= 3) || (b.name === 'nether_wart' && age >= 3);
             },
-            maxDistance: 16
+            maxDistance: 16,
+            count: 20
         });
 
-        if (target) {
+        // Tìm tất cả ô đất trống (đã cuốc mà chưa trồng)
+        const emptyFarmlands = bot.findBlocks({
+            matching: b => {
+                if (!b || !b.position || b.name !== 'farmland') return false;
+                const blockAbove = bot.blockAt(b.position.offset(0, 1, 0));
+                return blockAbove && blockAbove.name === 'air';
+            },
+            maxDistance: 16,
+            count: 20
+        });
+
+        // Gộp lại và sắp xếp theo khoảng cách gần nhất
+        const targets = [
+            ...matureCrops.map(p => ({ pos: p, type: 'harvest' })),
+            ...emptyFarmlands.map(p => ({ pos: p, type: 'plant' }))
+        ].sort((a, b) => bot.entity.position.distanceTo(a.pos) - bot.entity.position.distanceTo(b.pos));
+
+        if (targets.length > 0) {
+            const target = targets[0];
+            const block = bot.blockAt(target.pos);
+
             try {
-                logThink(`Đang gặt ${target.name} tại ${target.position}...`);
                 const move = configureMovements(bot);
                 bot.pathfinder.setMovements(move);
-                await bot.pathfinder.goto(new goals.GoalGetToBlock(target.position.x, target.position.y, target.position.z));
 
-                await bot.dig(target);
-                await sleep(500);
+                if (target.type === 'harvest') {
+                    logThink(`Đang đi thu hoạch ${block.name}...`);
+                    await bot.pathfinder.goto(new goals.GoalGetToBlock(target.pos.x, target.pos.y, target.pos.z));
+                    await bot.dig(block);
+                    await sleep(800);
 
-                // Trồng lại ngay
-                const seedName = SEED_TYPES[target.name];
-                const seed = bot.inventory.items().find(item => item.name === seedName);
-                if (seed) {
-                    const dirt = bot.blockAt(target.position.offset(0, -1, 0));
-                    await bot.equip(seed, 'hand');
-                    await bot.placeBlock(dirt, { x: 0, y: 1, z: 0 });
-                }
-            } catch (err) {
-                logThink(`Lỗi khi gặt: ${err.message}`);
-            }
-        } else {
-            // 2. Nếu không có cây chín, tìm đất trống để trồng
-            const emptyFarmland = bot.findBlock({
-                matching: b => {
-                    if (!b || !b.position || b.name !== 'farmland') return false;
-                    const blockAbove = bot.blockAt(b.position.offset(0, 1, 0));
-                    return blockAbove && blockAbove.name === 'air';
-                },
-                maxDistance: 16
-            });
-
-            if (emptyFarmland) {
-                // Tìm hạt giống bất kỳ trong túi
-                const seed = bot.inventory.items().find(item => Object.values(SEED_TYPES).includes(item.name));
-                if (seed) {
-                    try {
-                        logThink(`Đang trồng ${seed.name} vào đất trống tại ${emptyFarmland.position}...`);
-                        const move = configureMovements(bot);
-                        bot.pathfinder.setMovements(move);
-                        await bot.pathfinder.goto(new goals.GoalGetToBlock(emptyFarmland.position.x, emptyFarmland.position.y, emptyFarmland.position.z));
-
-                        await bot.equip(seed, 'hand');
-                        await bot.placeBlock(emptyFarmland, { x: 0, y: 1, z: 0 });
-                    } catch (err) {
-                        logThink(`Lỗi khi trồng: ${err.message}`);
+                    const seedName = SEED_TYPES[block.name];
+                    const seed = bot.inventory.items().find(item => item.name === seedName);
+                    if (seed) {
+                        const farmland = bot.blockAt(target.pos.offset(0, -1, 0));
+                        if (farmland && farmland.name === 'farmland') {
+                            await bot.equip(seed, 'hand');
+                            await bot.placeBlock(farmland, { x: 0, y: 1, z: 0 });
+                            logThink(`Đã trồng lại ${seedName}.`);
+                        }
                     }
                 } else {
-                    logThink("Không có cây chín và cũng hết hạt giống để trồng rồi!");
-                    await sleep(5000);
+                    const seed = bot.inventory.items().find(item => Object.values(SEED_TYPES).includes(item.name));
+                    if (seed) {
+                        logThink(`Phát hiện đất trống, đang đi trồng ${seed.name}...`);
+                        await bot.pathfinder.goto(new goals.GoalGetToBlock(target.pos.x, target.pos.y, target.pos.z));
+                        await bot.equip(seed, 'hand');
+                        await bot.placeBlock(block, { x: 0, y: 1, z: 0 });
+                        logThink(`Đã trồng ${seed.name} vào ô đất trống.`);
+                    } else {
+                        await sleep(2000);
+                    }
                 }
-            } else {
-                logThink("Mọi thứ đã xong xuôi, đang chờ cây lớn...");
-                await sleep(5000);
-            }
+            } catch (err) { }
+        } else {
+            logThink("Không tìm thấy cây chín hay đất trống nào quanh đây.");
+            await sleep(5000);
         }
-        await sleep(1000);
+        await sleep(500);
     }
 }
 
@@ -259,35 +392,24 @@ async function storeItems() {
         maxDistance: 8
     });
 
-    if (!chestBlock) {
-        bot.chat("Tui không tìm thấy cái rương nào quanh đây hết!");
-        return;
-    }
+    if (!chestBlock) return "Tui không tìm thấy cái rương nào quanh đây hết!";
 
     try {
         const move = configureMovements(bot);
         bot.pathfinder.setMovements(move);
         await bot.pathfinder.goto(new goals.GoalGetToBlock(chestBlock.position.x, chestBlock.position.y, chestBlock.position.z));
-
         const chest = await bot.openChest(chestBlock);
-        bot.chat("Đang cất đồ...");
-
         for (const item of bot.inventory.items()) {
-            // Không cất thức ăn, vũ khí và công cụ quan trọng
             const isFood = FOOD_NAMES.includes(item.name);
             const isTool = item.name.includes('sword') || item.name.includes('pickaxe') || item.name.includes('axe') || item.name.includes('shovel');
-
             if (!isFood && !isTool) {
-                try {
-                    await chest.deposit(item.type, null, item.count);
-                    await sleep(200);
-                } catch (e) { }
+                try { await chest.deposit(item.type, null, item.count); await sleep(200); } catch (e) { }
             }
         }
         chest.close();
-        bot.chat("Đã cất xong đồ đạc không cần thiết!");
+        return "Đã cất xong đồ đạc không cần thiết!";
     } catch (err) {
-        bot.chat(`Không thể mở rương: ${err.message}`);
+        return `Không thể mở rương: ${err.message}`;
     }
 }
 
@@ -486,40 +608,33 @@ async function runIdleBehavior() {
     const r = Math.random();
 
     try {
-        if (r < 0.25) { // Đi dạo loanh quanh (tăng phạm vi lên 15)
+        if (r < 0.3) { // Đi dạo loanh quanh
             const x = (Math.random() - 0.5) * 15;
             const z = (Math.random() - 0.5) * 15;
             const targetPos = bot.entity.position.offset(x, 0, z);
             const move = configureMovements(bot);
             bot.pathfinder.setMovements(move);
             bot.pathfinder.setGoal(new goals.GoalNear(targetPos.x, targetPos.y, targetPos.z, 2));
-            logThink("Đang đi dạo xa xa cho thoải mái...");
-        } else if (r < 0.45) { // Nhìn vào người chơi gần nhất
-            const playerFilter = e => e.type === 'player' && e.username !== bot.username;
-            const player = bot.nearestEntity(playerFilter);
+        } else if (r < 0.6) { // Nhìn vào người chơi gần nhất hoặc nhìn xung quanh
+            const player = bot.nearestEntity(e => isPlayerEntity(e));
             if (player && player.position.distanceTo(bot.entity.position) < 8) {
-                await bot.lookAt(player.position.offset(0, player.height, 0));
-                logThink(`Nhìn xem ${player.username} đang làm gì...`);
-            } else { // Nếu không có người thì nhìn xung quanh
+                await bot.lookAt(player.position.offset(0, player.height || 1.6, 0));
+            } else {
                 const yaw = Math.random() * Math.PI * 2;
                 const pitch = (Math.random() - 0.5) * Math.PI;
                 await bot.look(yaw, pitch);
             }
-        } else if (r < 0.55) { // Nhắn tin bâng quơ
-            const msg = IDLE_MESSAGES[Math.floor(Math.random() * IDLE_MESSAGES.length)];
-            bot.chat(msg);
-        } else if (r < 0.7) { // Nháy mắt / Quay vòng vòng (Spin)
-            logThink("Đang quẩy một tí!");
-            for (let i = 0; i < 8; i++) {
-                await bot.look(bot.entity.yaw + Math.PI / 4, bot.entity.pitch);
-                await sleep(50);
+        } else if (r < 0.75) { // Xoay người một chút
+            for (let i = 0; i < 6; i++) {
+                await bot.look(bot.entity.yaw + Math.PI / 3, bot.entity.pitch);
+                await sleep(60);
             }
-        } else if (r < 0.85) { // Nhảy lên
+        } else if (r < 0.9) { // Nhảy nhẹ một cái
             bot.setControlState('jump', true);
             await sleep(200);
             bot.setControlState('jump', false);
-        } else { // Spam ngồi
-            await spamSneak(3);
+        } else { // Cúi chào nhẹ
+            await spamSneak(2);
         }
     } catch (err) { }
 }
@@ -644,15 +759,246 @@ async function startAttackLoop() {
     }
 }
 
+// --- BOT ACTIONS (THUẦN LỆNH) ---
+const botActions = {
+    followPlayer: (args = {}) => {
+        resetStates();
+        const targetInfo = findPlayerSmart(args.username);
+        if (targetInfo?.entity) {
+            followTarget = targetInfo.entity;
+            return `Đang đi theo ${targetInfo.name} nè!`;
+        }
+        const pos = bot.entity.position;
+        const botPos = `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}`;
+        if (targetInfo?.isFar) {
+            return `Tui thấy ${targetInfo.name} đang online nhưng bạn ở xa quá (ngoài tầm nhìn)! Tui đang ở tọa độ: ${botPos}. Bạn hãy lại gần tui nha!`;
+        }
+        return `Tui hổng thấy bạn ở đâu quanh đây cả! Tui đang đứng tại tọa độ: ${botPos}. Hãy lại gần tui nhé!`;
+    },
+    stopAction: () => {
+        resetStates();
+        bot.pathfinder.setGoal(null);
+        bot.clearControlStates();
+        return "Đã dừng mọi việc rồi nha.";
+    },
+    gotoLocation: async (args) => {
+        resetStates();
+        try {
+            const { x, y, z } = args;
+            const move = configureMovements(bot);
+            bot.pathfinder.setMovements(move);
+            await bot.pathfinder.goto(new goals.GoalBlock(x, y, z));
+            return `Đã đến tọa độ ${x} ${y} ${z}!`;
+        } catch (err) {
+            return `Hổng đến đó được: ${err.message}`;
+        }
+    },
+    digBlock: async (args) => {
+        const { blockName } = args;
+        if (isDigging && targetBlockName === blockName) return `Tui vẫn đang hì hục đào ${blockName} mà!`;
+        resetStates();
+        isDigging = true;
+        targetBlockName = blockName;
+        startDiggingLoop();
+        return `Ok, để tui đi xử đẹp mấy khối ${blockName} cho!`;
+    },
+    attackEntity: async (args) => {
+        const { entityName } = args;
+        resetStates();
+        targetMobName = entityName;
+        isAttacking = true;
+        startAttackLoop();
+        return `Xung phong! Săn ${entityName}!`;
+    },
+    guardArea: () => {
+        resetStates();
+        isGuardMode = true;
+        guardPos = bot.entity.position.clone();
+        return `Nhận lệnh! Đang gác tại tọa độ ${Math.round(guardPos.x)}, ${Math.round(guardPos.y)}, ${Math.round(guardPos.z)}`;
+    },
+    startFarming: () => {
+        resetStates();
+        isFarming = true;
+        startFarmingLoop();
+        return "Bắt đầu làm ruộng thôi nào! Tui sẽ gặt và trồng lại cây cho.";
+    },
+    protectPlayer: (args = {}) => {
+        resetStates();
+        const targetInfo = findPlayerSmart(args.username);
+        if (targetInfo?.entity) {
+            followTarget = targetInfo.entity;
+            isBodyguardMode = true;
+            return `Ok! Tui sẽ đi theo và bảo vệ ${targetInfo.name} hết mình!`;
+        }
+        const pos = bot.entity.position;
+        const botPos = `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}`;
+        if (targetInfo?.isFar) {
+            return `Tui thấy ${targetInfo.name} đang online nhưng bạn ở xa quá! Tui đang ở tọa độ: ${botPos}. Hãy lại gần tui để tui bảo vệ nha!`;
+        }
+        return `Tui không thấy bạn đâu để bảo vệ hết! Tui đang ở tọa độ: ${botPos}.`;
+    },
+    storeItems: async () => {
+        return await storeItems();
+    },
+    autoEquipArmor: async () => {
+        await autoEquipArmor();
+        return "Đã kiểm tra và mặc bộ giáp tốt nhất có thể!";
+    },
+    eatFood: async () => {
+        await autoEat();
+        return `Đã ăn xong, hiện tại HP: ${Math.round(bot.health)}, Food: ${Math.round(bot.food)}`;
+    },
+    setIdleMode: (args) => {
+        isIdleEnabled = args.enabled;
+        return `Đã ${args.enabled ? 'bật' : 'tắt'} chế độ tự chơi (Idle Mode).`;
+    },
+    dropItem: async (args) => {
+        const { itemName, count = 1 } = args;
+        const item = bot.inventory.items().find(i => i.name === itemName);
+        if (!item) return `Tui làm gì có ${itemName} mà vứt.`;
+        try {
+            await bot.toss(item.type, null, count);
+            return `Đã vứt ${count} cái ${itemName} ra đất.`;
+        } catch (err) {
+            return `Lỗi vứt đồ: ${err.message}`;
+        }
+    },
+    checkStatus: () => {
+        return `HP: ${Math.round(bot.health)}/20 | Food: ${Math.round(bot.food)}/20 | Vị trí: X: ${Math.round(bot.entity.position.x)}, Y: ${Math.round(bot.entity.position.y)}, Z: ${Math.round(bot.entity.position.z)}`;
+    }
+};
+
+// --- HƯỚNG DẪN LỆNH ---
+async function showHelp() {
+    const helpMsg = `📖 Danh Sách Lệnh (Thuần Lệnh 0ms):
+- follow [tên]: Đi theo bạn
+- stop: Dừng mọi hành động
+- goto [x] [y] [z]: Đi tới tọa độ
+- dig [tên_khối]: Đào khối liên tục
+- attack [tên_quái]: Săn/Đánh quái vật
+- guard: Canh gác tại chỗ
+- farm: Làm ruộng tự động
+- protect [tên]: Vệ sĩ bảo vệ bạn
+- store: Cất đồ vào rương
+- armor: Mặc bộ giáp tốt nhất
+- drop [item] [số_lượng]: Vứt đồ
+- dropall: Xả sạch túi đồ
+- eat: Ăn đồ ăn hồi máu/đói
+- status: Xem máu, đói & tọa độ
+- scan: Quét thực thể quanh bot
+- idle [on/off]: Bật/tắt tự do
+- help: Hiện bảng này`;
+    await safeChat(helpMsg);
+}
+
+// --- XỬ LÝ LỆNH TRỰC TIẾP ---
+function handleManualCommand(username, message) {
+    const args = message.trim().split(/\s+/);
+    const command = args[0].toLowerCase();
+
+    switch (command) {
+        case 'follow':
+            safeChat(botActions.followPlayer({ username: args[1] || username }));
+            break;
+        case 'stop':
+            safeChat(botActions.stopAction());
+            break;
+        case 'goto':
+            if (args.length < 4) return;
+            botActions.gotoLocation({ x: parseFloat(args[1]), y: parseFloat(args[2]), z: parseFloat(args[3]) }).then(res => safeChat(res));
+            break;
+        case 'dig':
+            if (args.length < 2) return;
+            botActions.digBlock({ blockName: args[1] }).then(res => safeChat(res));
+            break;
+        case 'attack':
+            if (args.length < 2) return;
+            botActions.attackEntity({ entityName: args[1] }).then(res => safeChat(res));
+            break;
+        case 'guard':
+            safeChat(botActions.guardArea());
+            break;
+        case 'farm':
+            safeChat(botActions.startFarming());
+            break;
+        case 'protect':
+            safeChat(botActions.protectPlayer({ username: args[1] || username }));
+            break;
+        case 'store':
+            botActions.storeItems().then(res => safeChat(res));
+            break;
+        case 'armor':
+            botActions.autoEquipArmor().then(res => safeChat(res));
+            break;
+        case 'status':
+            safeChat(botActions.checkStatus());
+            break;
+        case 'help':
+            showHelp();
+            break;
+        case 'drop':
+            if (args.length < 2) return;
+            botActions.dropItem({ itemName: args[1], count: parseInt(args[2]) || 1 }).then(res => safeChat(res));
+            break;
+        case 'dropall':
+            bot.chat('Đang xả hết đồ...');
+            (async () => {
+                for (const i of bot.inventory.items()) {
+                    try { await bot.tossStack(i); await sleep(200); } catch (e) { }
+                }
+                bot.chat('Đã xả xong!');
+            })();
+            break;
+        case 'scan':
+            const nearby = Object.values(bot.entities)
+                .filter(e => e && e !== bot.entity && e.position.distanceTo(bot.entity.position) < 10)
+                .map(e => `[${e.type}] ${e.username || e.name}`)
+                .join(', ');
+            safeChat(nearby ? `Quanh bot có: ${nearby}` : 'Không thấy thực thể nào quanh đây.');
+            break;
+        case 'eat':
+            botActions.eatFood().then(res => safeChat(res));
+            break;
+        case 'idle':
+            if (args[1] === 'on') {
+                safeChat(botActions.setIdleMode({ enabled: true }));
+            } else if (args[1] === 'off') {
+                safeChat(botActions.setIdleMode({ enabled: false }));
+            } else {
+                safeChat(`Chế độ tự chơi đang: ${isIdleEnabled ? 'BẬT' : 'TẮT'}. Gõ "idle on" hoặc "idle off" để đổi.`);
+            }
+            break;
+        case 'sleep':
+            const bed = bot.findBlock({
+                matching: block => bot.isABed(block),
+                maxDistance: 5
+            });
+            if (bed) {
+                bot.sleep(bed).then(() => safeChat('Khò khò... ngủ ngon nhé!')).catch(err => safeChat(`Tui không ngủ được: ${err.message}`));
+            } else {
+                safeChat('Tui không tìm thấy cái giường nào quanh đây hết!');
+            }
+            break;
+        case 'wake':
+            bot.wake().then(() => safeChat('Chào buổi sáng!')).catch(err => safeChat(`Không dậy được: ${err.message}`));
+            break;
+    }
+}
+
 // --- EVENTS ---
 
 bot.on('physicTick', () => {
     if (isDigging || isAttacking) return;
     autoOpenDoors();
-    runIdleBehavior(); // Chạy hành vi lúc rảnh rỗi
-    runGuardLogic();   // Chạy chế độ canh gác
+    runIdleBehavior();
+    runGuardLogic();
 
     if (followTarget) {
+        if (!followTarget.isValid) {
+            const reFound = findPlayerSmart(followTarget.username);
+            if (reFound?.entity) followTarget = reFound.entity;
+            else return;
+        }
         const p = followTarget.position;
         const b = bot.entity.position;
         const dist = b.distanceTo(p);
@@ -660,13 +1006,12 @@ bot.on('physicTick', () => {
         if (dist < 2.5) {
             bot.pathfinder.setGoal(null);
             bot.clearControlStates();
-        } else if (dist > 4 && !bot.pathfinder.isMoving()) {
-            const defaultMove = new Movements(bot);
-            defaultMove.canEntityStandOn = false;
+        } else if (dist > 3.5 && !bot.pathfinder.isMoving()) {
+            const defaultMove = configureMovements(bot);
             bot.pathfinder.setMovements(defaultMove);
-            bot.pathfinder.setGoal(new goals.GoalFollow(followTarget, 3), true);
+            bot.pathfinder.setGoal(new goals.GoalFollow(followTarget, 2), true);
         }
-        bot.lookAt(p.offset(0, followTarget.height, 0));
+        bot.lookAt(p.offset(0, followTarget.height || 1.6, 0));
     } else {
         const itemFilter = e => (e.name === 'item' || e.type === 'object') && e.position.distanceTo(bot.entity.position) < 10;
         const itemInterest = bot.nearestEntity(itemFilter);
@@ -681,182 +1026,51 @@ bot.on('physicTick', () => {
             const move = configureMovements(bot);
             bot.pathfinder.setMovements(move);
             bot.pathfinder.setGoal(new goals.GoalFollow(itemInterest, 1), true);
-            return;
         } else {
             targetPickupItem = null;
         }
-
-        // Đã xóa phần tự động nhìn người chơi ở đây để tránh việc bot "chằm chằm" nhìn bạn khi đi dạo.
-        // Logic nhìn người chơi đã được đưa vào runIdleBehavior với tỉ lệ ngẫu nhiên.
     }
 });
 
-bot.on('chat', async (username, message) => {
-    if (username === bot.username) return;
-    try {
-        const args = message.split(' ');
-        const command = args[0].toLowerCase();
+bot.on('chat', (username, message) => {
+    if (!username) return;
+    const lowerUser = username.toLowerCase();
+    if (lowerUser === bot.username.toLowerCase() || lowerUser === BOT_USERNAME.toLowerCase() || lowerUser === 'server' || lowerUser === 'system') return;
+    if (/XYZ:\s*-?\d+/i.test(message) || /☀|☁|🌧/.test(message)) return;
 
-        if (['follow', 'stop', 'goto', 'dig', 'attack', 'guard', 'farm', 'protect'].includes(command)) {
-            isDigging = false;
-            isAttacking = false;
-            isGuardMode = false;
-            isFarming = false;
-            isBodyguardMode = false;
-            followTarget = null;
-            targetBlockName = null;
-            targetEntity = null;
-            targetMobName = null;
-            targetPickupItem = null;
-        }
-
-        switch (command) {
-            case 'follow':
-                const target = bot.players[username]?.entity;
-                if (target) { followTarget = target; bot.chat('Ok!'); }
-                break;
-            case 'stop':
-                bot.pathfinder.setGoal(null); bot.clearControlStates(); bot.chat('Đã dừng.');
-                break;
-            case 'goto':
-                if (args.length < 4) return;
-                const x = parseFloat(args[1]), y = parseFloat(args[2]), z = parseFloat(args[3]);
-                bot.chat(`Đi tới ${x} ${y} ${z}`);
-                const move = configureMovements(bot);
-                bot.pathfinder.setMovements(move);
-                bot.pathfinder.goto(new goals.GoalBlock(x, y, z)).catch(e => { });
-                break;
-            case 'dig':
-                if (args.length < 2) return;
-                targetBlockName = args[1]; isDigging = true; startDiggingLoop();
-                bot.chat('Đào ' + targetBlockName);
-                break;
-            case 'attack':
-                if (args.length < 2) return;
-                targetMobName = args[1]; isAttacking = true; targetEntity = null; startAttackLoop();
-                bot.chat('Săn ' + targetMobName);
-                break;
-            case 'guard':
-                isGuardMode = true;
-                guardPos = bot.entity.position.clone();
-                bot.chat(`Đang gác tại tọa độ ${Math.round(guardPos.x)}, ${Math.round(guardPos.y)}, ${Math.round(guardPos.z)}`);
-                break;
-            case 'farm':
-                isFarming = true;
-                bot.chat('Bắt đầu làm ruộng thôi nào!');
-                startFarmingLoop();
-                break;
-            case 'protect':
-                const protectTarget = bot.players[username]?.entity;
-                if (protectTarget) {
-                    followTarget = protectTarget;
-                    isBodyguardMode = true;
-                    bot.chat('Tui sẽ bảo vệ bạn hết mình!');
-                } else {
-                    bot.chat('Tui không thấy bạn đâu hết!');
-                }
-                break;
-            case 'store':
-                await storeItems();
-                break;
-            case 'drop':
-                if (args.length < 2) return;
-                const itemName = args[1];
-                const count = parseInt(args[2]) || 1;
-                const itemToDrop = bot.inventory.items().find(i => i.name === itemName);
-                if (itemToDrop) {
-                    try {
-                        await bot.toss(itemToDrop.type, null, count);
-                        bot.chat(`Đã xả ${count} ${itemName}.`);
-                    } catch (err) {
-                        bot.chat(`Không thể xả đồ: ${err.message}`);
-                    }
-                } else {
-                    bot.chat(`Tui không tìm thấy ${itemName} trong túi đồ!`);
-                }
-                break;
-            case 'armor':
-                await autoEquipArmor(); bot.chat('Đã mặc giáp.');
-                break;
-            case 'dropall':
-                bot.chat('Đang xả hết đồ...');
-                for (const i of bot.inventory.items()) {
-                    try {
-                        await bot.tossStack(i);
-                        await sleep(200);
-                    } catch (e) { }
-                }
-                bot.chat('Đã xả xong!');
-                break;
-            case 'scan':
-                const nearby = Object.values(bot.entities).filter(e => e.position.distanceTo(bot.entity.position) < 10).map(e => `[${e.type}] ${e.name}`).join(', ');
-                bot.chat(nearby || 'Không thấy gì.');
-                break;
-            case 'status':
-                bot.chat(`HP: ${Math.round(bot.health)} | Food: ${Math.round(bot.food)}`);
-                break;
-            case 'sleep':
-                const bed = bot.findBlock({
-                    matching: block => bot.isABed(block),
-                    maxDistance: 5
-                });
-                if (bed) {
-                    try {
-                        await bot.sleep(bed);
-                        bot.chat('Khò khò... ngủ ngon nhé!');
-                    } catch (err) {
-                        bot.chat(`Tui không ngủ được: ${err.message}`);
-                    }
-                } else {
-                    bot.chat('Tui không tìm thấy cái giường nào quanh đây hết!');
-                }
-                break;
-            case 'wake':
-                try {
-                    await bot.wake();
-                    bot.chat('Chào buổi sáng!');
-                } catch (err) {
-                    bot.chat(`Không dậy được: ${err.message}`);
-                }
-                break;
-            case 'idle':
-                if (args[1] === 'on') {
-                    isIdleEnabled = true;
-                    bot.chat('Đã bật chế độ tự chơi (Idle Mode).');
-                } else if (args[1] === 'off') {
-                    isIdleEnabled = false;
-                    bot.chat('Đã tắt chế độ tự chơi.');
-                } else {
-                    bot.chat(`Chế độ tự chơi đang: ${isIdleEnabled ? 'BẬT' : 'TẮT'}. Gõ "idle on/off" để thay đổi.`);
-                }
-                break;
-            case 'eat':
-                await autoEat();
-                if (!isEating && bot.food >= 20 && bot.health >= 20) bot.chat('Tui no rồi, máu cũng đầy nữa!');
-                else if (!isEating) bot.chat('Tui không có đồ ăn phù hợp trong túi!');
-                break;
-        }
-    } catch (err) {
-        console.log('⚠️ Lỗi lệnh chat:', err);
-    }
+    handleManualCommand(username, message);
 });
 
 bot.on('error', (err) => console.log('⚠️ Lỗi:', err));
 bot.on('kicked', (reason) => console.log('❌ Bị kick:', reason));
-// Tự động đánh trả khi bị tấn công
-bot.on('entityHurt', (entity) => {
-    if (entity === bot.entity) {
-        const attacker = Object.values(bot.entities).find(e => {
-            if (!e || e.type !== 'mob') return false; // Chỉ đánh trả quái vật, không đánh người chơi
-            return e.position.distanceTo(bot.entity.position) < 5;
-        });
 
-        if (attacker && !isAttacking) {
-            logThink(`Bị ${attacker.name} tấn công! Đang phản công...`);
-            targetMobName = attacker.name;
-            targetEntity = attacker;
-            isAttacking = true;
-            startAttackLoop();
-        }
+// --- NHẬN LỆNH TRỰC TIẾP TỪ TERMINAL (CLI) ---
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false
+});
+
+rl.on('line', (line) => {
+    const input = line.trim();
+    if (!input) return;
+
+    // 1. Chat tin nhắn vào server: "say <nội dung>" hoặc "chat <nội dung>"
+    if (input.startsWith('say ') || input.startsWith('chat ')) {
+        const text = input.substring(input.indexOf(' ') + 1);
+        bot.chat(text);
+        console.log(`\x1b[32m[Terminal Chat]\x1b[0m ${text}`);
+        return;
     }
+
+    // 2. Gửi lệnh server Minecraft (bắt đầu bằng /): /tp, /spawn, /home, /tpa...
+    if (input.startsWith('/')) {
+        bot.chat(input);
+        console.log(`\x1b[32m[Terminal Server Cmd]\x1b[0m ${input}`);
+        return;
+    }
+
+    // 3. Thực thi lệnh điều khiển bot trực tiếp (farm, guard, dig, stop, status, goto, armor, store...)
+    console.log(`\x1b[32m[Terminal Lệnh Bot]\x1b[0m ${input}`);
+    handleManualCommand('Terminal', input);
 });
